@@ -11,6 +11,9 @@ import numpy as np
 import pandas as pd
 import joblib
 import requests
+import re
+
+
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.mixture import GaussianMixture
@@ -20,7 +23,7 @@ from sklearn.naive_bayes import CategoricalNB
 from pybaseball import playerid_lookup, playerid_reverse_lookup
 
 # Project helpers
-from General_Initialization import encode_count, get_archetype
+from General_Initialization import encode_count, get_archetype, classify_archetype
 
 
 class Hitter:
@@ -41,18 +44,18 @@ class Hitter:
         # ----- identity/data -----
         self.first_lower = first_lower
         self.first_upper = first_upper
-        self.last_lower  = last_lower
-        self.last_upper  = last_upper
-        self.team_name   = team_name
-        self.team_id     = team_id
-        self.full_lower  = f"{first_lower} {last_lower}"
-        self.full_upper  = f"{first_upper} {last_upper}"
+        self.last_lower = last_lower
+        self.last_upper = last_upper
+        self.team_name = team_name
+        self.team_id = team_id
+        self.full_lower = f"{first_lower} {last_lower}"
+        self.full_upper = f"{first_upper} {last_upper}"
 
         # Dataframes passed in
-        self.batter_data    = batter_data
-        self.encoder_data   = encoder_data
+        self.batter_data = batter_data
+        self.encoder_data = encoder_data
         self.bat_stats_2025 = bat_stats_2025
-        self.batting        = batting
+        self.batting = batting
 
         # ----- player_id priority: use provided override, else robust lookup -----
         if player_id is not None:
@@ -61,11 +64,26 @@ class Hitter:
             self.player_id = self._lookup_player_id()
 
         # ---- load encoders (trained elsewhere) ----
-        self.stand_encoder   = joblib.load("encoders/stand_encoder.joblib")
-        self.arch_encoder    = joblib.load("encoders/arch_encoder.joblib")
-        self.outcome_encoder = joblib.load("encoders/outcome_encoder.joblib")
+        encoder_files = {
+            "stand_encoder": "encoders/stand_encoder.joblib",
+            "arch_encoder": "encoders/arch_encoder.joblib",
+            "outcome_encoder": "encoders/outcome_encoder.joblib",
+        }
+        for name, path in encoder_files.items():
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Required encoder file not found: {path}. "
+                    f"Cannot initialize Hitter object for {self.full_upper} without it."
+                )
+            try:
+                setattr(self, name, joblib.load(path))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load {name} from {path} for {self.full_upper}: {e}"
+                )
 
         # ---- archetype + encoded archetype ----
+        batting['Hitter_Archetype'] = batting.apply(classify_archetype, axis=1)
         self.hitter_archetype = get_archetype(self.last_upper, self.batting)
         if self.hitter_archetype is None:
             raise ValueError(f"Could not resolve Hitter_Archetype for {self.full_upper}.")
@@ -115,7 +133,7 @@ class Hitter:
 
     def _lookup_player_id(self) -> int:
         first = self._strip_accents(self.first_upper).strip()
-        last  = self._strip_accents(self.last_upper).strip()
+        last = self._strip_accents(self.last_upper).strip()
 
         df = playerid_lookup(last, first)
         if df.empty:
@@ -140,6 +158,7 @@ class Hitter:
             "Tried multiple name variants. Double-check spelling (accents, Jr./Sr.) "
             "or pass an explicit player_id override."
         )
+
     @staticmethod
     def _ensure_pitch_group(df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -148,32 +167,31 @@ class Hitter:
         """
         if 'pitch_group' in df.columns:
             return df
-    
+
         if 'pitch_type' not in df.columns:
-            raise ValueError("Missing 'pitch_type' column; cannot derive     'pitch_group'.")
-    
+            raise ValueError("Missing 'pitch_type' column; cannot derive 'pitch_group'.")
+
         out = df.copy()
-    
+
         # Drop rows with missing pitch_type
         total_rows = len(out)
         out = out.dropna(subset=['pitch_type'])
         dropped = total_rows - len(out)
-    
+
         if total_rows > 0 and (dropped / total_rows) > 0.10:
             raise ValueError(
                 f"Over 10% of rows ({dropped}/{total_rows}) missing 'pitch_type'. "
                 "Likely systemic data issue."
             )
-    
+
         pitch_group_map = {
             'FF': '4F', 'FA': '4F', 'FC': 'CF', 'SI': '2F', 'FT': '2F',
             'SL': 'S',  'ST': 'S',  'CU': 'C',  'KC': 'C',  'CS': 'C',
             'CH': 'CH', 'FS': 'CH'
         }
         out['pitch_group'] = out['pitch_type'].map(pitch_group_map)
-    
-        return out
 
+        return out
 
     # ---------- Feature importance ----------
     def _filter_and_fit_importance(self, hand: str, group: str):
@@ -270,7 +288,7 @@ class Hitter:
         # Build expected labels straight from the fitted GMMs
         if not getattr(self, "gmm_models", None):
             raise RuntimeError(f"No GMMs present for {self.full_upper}; cannot build label space.")
-    
+
         labels = []
         for (hand, group), (gmm, _, _) in self.gmm_models.items():
             n = int(getattr(gmm, "n_components", 0) or 0)
@@ -280,119 +298,348 @@ class Hitter:
         classes = sorted(set(labels))
         if not classes:
             raise RuntimeError(f"Empty label space synthesized for {self.full_upper}.")
-    
+
         # Fit encoder on the full local label space
         enc = LabelEncoder()
         enc.fit(classes)
         self.cluster_encoder = enc
         self.allowed_cluster_labels = np.array(enc.classes_)  # optional: for debugging
-    
+
         # Keep a convenience view of encoder_data with assigned clusters (not used to fit)
         edf = self._ensure_pitch_group(self.encoder_data.copy())
         edf['pitch_cluster'] = edf.apply(self._assign_row_cluster, axis=1)
         self.encoder_data_with_clusters = edf
-    
+
         os.makedirs("encoders", exist_ok=True)
         joblib.dump(self.cluster_encoder, f"encoders/cluster_encoder__{self.last_lower}.joblib")
+
+    # ---------- assign cluster using hitter GMMs (class method) ----------
+    def _assign_row_cluster(self, row: pd.Series) -> str | float:
+        """
+        Assign a local cluster label using hitter-specific GMMs.
+
+        If invalid/missing inputs, returns np.nan and (optionally) records a reason
+        in self._cluster_na_reasons for upstream diagnostics.
+        """
+        # lazy-init NA reason counter
+        if not hasattr(self, "_cluster_na_reasons"):
+            from collections import Counter as _Counter
+            self._cluster_na_reasons = _Counter()
+
+        def _note(reason: str):
+            try:
+                self._cluster_na_reasons[reason] += 1
+            except Exception:
+                pass
+
+        hand = row.get('p_throws', None)
+        group = row.get('pitch_group', None)
+
+        # Validate hand/group
+        if hand not in ['R', 'L'] or group not in ['4F', '2F', 'CF', 'S', 'C', 'CH']:
+            _note("invalid_hand_or_group")
+            return np.nan
+
+        key = (hand, group)
+        if key not in self.gmm_models:
+            _note(f"missing_gmm_{hand}_{group}")
+            return np.nan
+
+        # Required kinematic features
+        rs = row.get('release_speed')
+        px = row.get('pfx_x')
+        pz = row.get('pfx_z')
+        if pd.isna(rs) or pd.isna(px) or pd.isna(pz):
+            _note("missing_features_release_speed_pfx_x_pfx_z")
+            return np.nan
+
+        gmm, scaler, weights = self.gmm_models[key]
+
+        # Guard against malformed GMM/Scaler
+        try:
+            x_df = pd.DataFrame([[rs, px, pz]], columns=['release_speed', 'pfx_x', 'pfx_z'])
+            xw = scaler.transform(x_df) * weights
+            comp = int(gmm.predict(xw)[0])
+        except Exception:
+            _note("gmm_predict_error")
+            return np.nan
+
+        return f"{hand}{group}{comp+1}"
+
+    @staticmethod
+    def _normalize_str(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return ""
+        s = str(x)
+        # strip accents, lower, single spaces
+        s = Hitter._strip_accents(s).lower().strip()
+        return re.sub(r"\s+", " ", s)
+    
+    @staticmethod
+    def _get_row_for_hitter(
+        df: pd.DataFrame,
+        *,
+        player_id: int | None,
+        first_upper: str | None = None,
+        last_upper: str | None = None,
+        full_upper: str | None = None,
+        team_name: str | None = None,
+    ):
+        if df is None or df.empty:
+            return None
+    
+        # 0) Prefer season 2025 if present
+        df2 = df.copy()
+        if "Season" in df2.columns:
+            # accept int 2025 or string "2025"
+            df2 = df2[df2["Season"].astype(str) == "2025"] if not df2.empty else df2
+    
+        # 1) Try ID across common column variants
+        if player_id is not None:
+            id_cols = ["player_id", "mlbamid", "mlbam", "key_mlbam", "mlb_id", "batter_id"]
+            for col in id_cols:
+                if col in df2.columns:
+                    m = df2[col].astype(str) == str(player_id)
+                    if m.any():
+                        return df2.loc[m].iloc[0]
+    
+        # 2) Normalize names and team for flexible matching
+        name_cols = [c for c in ["Name", "Player", "player", "player_name"] if c in df2.columns]
+        if not name_cols:
+            return None
+    
+        # Build normalized name column once
+        name_col = name_cols[0]
+        norm_name = df2[name_col].apply(Hitter._normalize_str)
+    
+        full_norm = Hitter._normalize_str(full_upper or "")
+        first_norm = Hitter._normalize_str(first_upper or "")
+        last_norm  = Hitter._normalize_str(last_upper or "")
+        team_norm  = Hitter._normalize_str(team_name or "")
+    
+        # 2a) Exact full-name match
+        if full_norm:
+            eq_full = norm_name == full_norm
+            if eq_full.any():
+                return df2.loc[eq_full].sort_values(by=[c for c in ["AB","PA"] if c in df2.columns], ascending=False).iloc[0]
+    
+        # 2b) Both tokens present (first & last)
+        if first_norm and last_norm:
+            has_both = norm_name.str.contains(rf"\b{re.escape(first_norm)}\b") & \
+                       norm_name.str.contains(rf"\b{re.escape(last_norm)}\b")
+            if has_both.any():
+                cand = df2.loc[has_both]
+                # If multiple and team present, try to disambiguate by team
+                team_cols = [c for c in ["Team", "Tm", "team", "team_name"] if c in cand.columns]
+                if team_cols and team_norm:
+                    tn = cand[team_cols[0]].apply(Hitter._normalize_str)
+                    by_team = cand[tn.str.contains(re.escape(team_norm))]  # substring ok
+                    if not by_team.empty:
+                        cand = by_team
+                return cand.sort_values(by=[c for c in ["AB","PA"] if c in df2.columns], ascending=False).iloc[0]
+    
+        # 2c) Last-name fallback
+        if last_norm:
+            has_last = norm_name.str.contains(rf"\b{re.escape(last_norm)}\b")
+            if has_last.any():
+                cand = df2.loc[has_last]
+                # Disambiguate by team if available
+                team_cols = [c for c in ["Team", "Tm", "team", "team_name"] if c in cand.columns]
+                if team_cols and team_norm:
+                    tn = cand[team_cols[0]].apply(Hitter._normalize_str)
+                    by_team = cand[tn.str.contains(re.escape(team_norm))]
+                    if not by_team.empty:
+                        cand = by_team
+                return cand.sort_values(by=[c for c in ["AB","PA"] if c in df2.columns], ascending=False).iloc[0]
+    
+        return None
+    
+    @staticmethod
+    def _safe_get(row, key, default=0):
+        try:
+            val = row[key]
+        except Exception:
+            return default
+        return default if pd.isna(val) else val
+    
+    @staticmethod
+    def compute_seasonal_xpa(
+        bat_stats_2025: pd.DataFrame, *,
+        player_id: int | None,
+        last_upper: str,
+        first_upper: str | None = None,
+        full_upper: str | None = None,
+        team_name: str | None = None,
+    ):
+        """
+        Returns (xba_ab, xpa) where:
+          xba_ab = Statcast xBA (per AB)
+          xpa    = per-PA hit probability = xBA * (AB/PA)
+        """
+        r = Hitter._get_row_for_hitter(
+            bat_stats_2025,
+            player_id=player_id,
+            first_upper=first_upper,
+            last_upper=last_upper,
+            full_upper=full_upper,
+            team_name=team_name,
+        )
+        if r is None:
+            raise ValueError(f"Missing season row in bat_stats_2025 for {last_upper} (by id or name).")
+    
+        if "xBA" not in r.index or pd.isna(r["xBA"]):
+            raise ValueError(f"Missing seasonal xBA in bat_stats_2025 for {full_upper or last_upper}.")
+    
+        AB = float(Hitter._safe_get(r, "AB", default=np.nan))
+        PA = Hitter._safe_get(r, "PA", default=np.nan)
+    
+        if pd.isna(PA):
+            BB  = float(Hitter._safe_get(r, "BB", 0.0))
+            HBP = float(Hitter._safe_get(r, "HBP", 0.0))
+            SF  = float(Hitter._safe_get(r, "SF", 0.0))
+            SH  = float(Hitter._safe_get(r, "SH", Hitter._safe_get(r, "SAC", 0.0)) or 0.0)
+            CI  = float(Hitter._safe_get(r, "CI", 0.0))
+            if pd.isna(AB):
+                raise ValueError(f"Missing AB (and PA) in bat_stats_2025 for {full_upper or last_upper}.")
+            PA = AB + BB + HBP + SF + SH + CI
+    
+        if AB <= 0 or PA <= 0:
+            raise ValueError(f"Non-positive AB ({AB}) or PA ({PA}) for {full_upper or last_upper}.")
+    
+        xba_ab = float(r["xBA"])
+        xpa = xba_ab * (AB / PA)
+        return xba_ab, xpa
+
 
 
     # ---------- Prepare hitter rows (assign + encode) ----------
     def _prepare_hitter_data(self):
-        # Player rows (may be empty)
-        if 'batter_name' in self.batter_data.columns:
-            df = self.batter_data[self.batter_data['batter_name'].str.lower() == self.full_lower].copy()
-        else:
-            df = self.batter_data.iloc[0:0].copy()
+        # ---- 0) Preconditions ----
+        if 'batter_name' not in self.batter_data.columns:
+            raise ValueError("batter_data missing required column 'batter_name'.")
 
+        # ---- 1) Start from a copy; enforce batter_name presence with 10% cap ----
+        df = self.batter_data.copy()
+        total0 = len(df)
+        if total0 == 0:
+            raise ValueError(f"No rows in batter_data for any player (cannot prepare data for {self.full_upper}).")
+
+        # Drop rows with missing batter_name
+        df = df.dropna(subset=['batter_name'])
+        dropped_bn = total0 - len(df)
+        if (dropped_bn / total0) > 0.10:
+            raise ValueError(
+                f">10% rows missing batter_name ({dropped_bn}/{total0}) — systemic data issue."
+            )
+
+        # Filter to this hitter only
+        df = df[df['batter_name'].str.lower() == self.full_lower].copy()
+        if df.empty:
+            raise ValueError(f"No batter_data rows found for hitter '{self.full_upper}' after filtering.")
+
+        # ---- 2) Ensure pitch_group (this will also drop/validate pitch_type per your 10% rule) ----
         df = self._ensure_pitch_group(df)
 
-        # Assign clusters (may all be NaN if GMMs missing features)
+        # ---- 3) Assign clusters from fitted GMMs (may yield NaN if inputs missing) ----
         df['pitch_cluster'] = df.apply(self._assign_row_cluster, axis=1)
 
-        # Ensure required columns exist
+        # ---- Assign Hitter Archetype
+        if 'Hitter_Archetype' not in df.columns:
+            df['Hitter_Archetype'] = get_archetype(self.last_upper, self.batting)
+
+        # ---- 4) Validate required columns exist (no silent creation) ----
         must_have = [
             'pitch_cluster', 'zone', 'balls', 'strikes', 'stand', 'description',
-            'estimated_ba_using_speedangle', 'Hitter_Archetype'
+            'Hitter_Archetype'
         ]
-        for c in must_have:
-            if c not in df.columns:
-                df[c] = np.nan
+        missing_cols = [c for c in must_have if c not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns in batter_data for {self.full_upper}: {missing_cols}")
 
-        # Map description → simple tokens
+        # ---- 5) Drop NA rows in required columns with 10% cap ----
+        total1 = len(df)
+        df_clean = df.dropna(subset=must_have)
+        dropped_req = total1 - len(df_clean)
+        if total1 > 0 and (dropped_req / total1) > 0.10:
+            # Provide a small breakdown of which columns are most responsible
+            na_counts = {c: int(df[c].isna().sum()) for c in must_have}
+            raise ValueError(
+                f">10% rows dropped due to NA in required columns ({dropped_req}/{total1}). "
+                f"NA breakdown: {na_counts}"
+            )
+        df = df_clean
+
+        # ---- 6) Map description to canonical tokens (strict) ----
         def _map_desc(desc):
-            if desc in ['ball', 'blocked_ball', 'pitchout']: return 'ball'
-            if desc in ['called_strike', 'swinging_strike', 'swinging_strike_blocked', 'missed_bunt']: return 'strike'
-            if desc in ['foul', 'foul_tip', 'foul_bunt', 'bunt_foul_tip']: return 'foul'
-            if desc == 'hit_by_pitch': return 'hbp'
-            if desc == 'hit_into_play': return 'bip'
-            return 'unknown'
+            if desc in ['ball', 'blocked_ball', 'pitchout']:
+                return 'ball'
+            if desc in ['called_strike', 'swinging_strike', 'swinging_strike_blocked', 'missed_bunt']:
+                return 'strike'
+            if desc in ['foul', 'foul_tip', 'foul_bunt', 'bunt_foul_tip']:
+                return 'foul'
+            if desc == 'hit_by_pitch':
+                return 'hbp'
+            if desc == 'hit_into_play':
+                return 'bip'
+            raise ValueError(f"Unrecognized pitch description '{desc}' for {self.full_upper}")
 
         df['description'] = df['description'].apply(_map_desc)
 
-        # Archetype tag (constant for this hitter)
+        # ---- 7) Archetype tag (constant for this hitter) ----
         df['Hitter_Archetype'] = self.hitter_archetype
 
-        # Cluster encode (no unseen labels now)
-        # Cluster encode (no fitting here — just transform)
+        # ---- 8) Encode clusters (encoder must be present/fitted) ----
         if getattr(self, "cluster_encoder", None) is None or not hasattr(self.cluster_encoder, "classes_"):
-            raise RuntimeError(f"cluster_encoder missing for {self.full_upper} (should have been created from GMMs).")
-        
-        valid = set(self.cluster_encoder.classes_)
-        mask = df['pitch_cluster'].isin(valid) & df['pitch_cluster'].notna()
-        df.loc[mask, 'pitch_cluster_enc'] = self.cluster_encoder.transform(df.loc[mask, 'pitch_cluster'])
-        df.loc[~mask, 'pitch_cluster_enc'] = np.nan
+            raise RuntimeError(f"cluster_encoder missing/unfitted for {self.full_upper}.")
 
-        # Ensure numeric basics
-        df['balls']   = pd.to_numeric(df['balls'], errors='coerce').fillna(0).astype(int)
-        df['strikes'] = pd.to_numeric(df['strikes'], errors='coerce').fillna(0).astype(int)
-        df['zone_enc'] = (pd.to_numeric(df['zone'], errors='coerce') - 1).round().astype('Int64')
+        if not set(df['pitch_cluster'].unique()).issubset(set(self.cluster_encoder.classes_)):
+            unknown = sorted(set(df['pitch_cluster'].unique()) - set(self.cluster_encoder.classes_))
+            raise ValueError(f"pitch_cluster contains labels not in encoder for {self.full_upper}: {unknown}")
 
-        # ---- count_enc: guaranteed scalar ----
-        def _safe_encode_count_scalar(b, s):
-            try:
-                out = encode_count(int(b), int(s))
-            except Exception:
-                return np.nan
-            if isinstance(out, dict):
-                if not out:
-                    return np.nan
-                k_max = max(out.items(), key=lambda kv: float(kv[1]))[0]
-                try: return int(k_max)
-                except Exception: return np.nan
+        df['pitch_cluster_enc'] = self.cluster_encoder.transform(df['pitch_cluster'])
+
+        # ---- 9) Basic numerics (strict) ----
+        # Do not silently coerce to 0 — validate numerics and error on bad rows.
+        for col in ['balls', 'strikes', 'zone']:
+            coerced = pd.to_numeric(df[col], errors='coerce')
+            bad = coerced.isna().sum()
+            if bad:
+                raise ValueError(f"Non-numeric or NA values in '{col}' for {self.full_upper} (count={bad}).")
+            df[col] = coerced
+
+        df['zone_enc'] = (df['zone'] - 1).round().astype(int)
+
+        # ---- 10) Encode count/stand/outcome/arch (no fallbacks) ----
+        # count_enc must be a scalar int 0..11; raise on any failure
+        def _encode_count_scalar(b, s):
+            out = encode_count(int(b), int(s))
             if isinstance(out, (list, tuple, np.ndarray, pd.Series)):
+                # choose argmax if distribution returned
                 arr = np.asarray(out, dtype=float).ravel()
-                if arr.size == 0 or np.isnan(arr).all(): return np.nan
+                if arr.size == 0 or np.isnan(arr).all():
+                    raise ValueError(f"encode_count produced empty/NaN distribution for {self.full_upper}.")
                 return int(np.nanargmax(arr))
             try:
                 return int(out)
-            except Exception:
-                return np.nan
+            except Exception as e:
+                raise ValueError(f"encode_count failed for balls={b}, strikes={s}: {e}")
 
-        df['count_enc'] = pd.Series(
-            (_safe_encode_count_scalar(b, s) for b, s in zip(df['balls'], df['strikes'])),
-            index=df.index
-        ).astype('Int64')
+        df['count_enc'] = [_encode_count_scalar(b, s) for b, s in zip(df['balls'], df['strikes'])]
 
         # stand_enc
-        if df['stand'].notna().any():
-            mask = df['stand'].notna()
-            df.loc[mask, 'stand_enc'] = self.stand_encoder.transform(df.loc[mask, 'stand'])
-            df.loc[~mask, 'stand_enc'] = np.nan
-        else:
-            df['stand_enc'] = np.nan
+        if df['stand'].isna().any():
+            raise ValueError(f"NA in 'stand' after cleaning for {self.full_upper}.")
+        df['stand_enc'] = self.stand_encoder.transform(df['stand'])
 
         # outcome_enc
-        if df['description'].notna().any():
-            mask = df['description'].notna()
-            df.loc[mask, 'outcome_enc'] = self.outcome_encoder.transform(df.loc[mask, 'description'])
-            df.loc[~mask, 'outcome_enc'] = np.nan
-        else:
-            df['outcome_enc'] = np.nan
+        if df['description'].isna().any():
+            raise ValueError(f"NA in 'description' after mapping for {self.full_upper}.")
+        df['outcome_enc'] = self.outcome_encoder.transform(df['description'])
 
         # arch_enc (constant)
-        df['arch_enc'] = self.arch_encoder.transform(df['Hitter_Archetype'].fillna('Unknown'))
+        df['arch_enc'] = self.arch_encoder.transform(df['Hitter_Archetype'])
 
-        # Final set (allow empty)
+        # ---- 11) Final keep/persist ----
         keep_cols = [
             'pitch_cluster_enc', 'zone_enc', 'count_enc', 'outcome_enc', 'arch_enc',
             'estimated_ba_using_speedangle', 'description'
@@ -400,84 +647,82 @@ class Hitter:
         extra_cols = ['pitch_cluster', 'zone', 'balls', 'strikes', 'stand', 'Hitter_Archetype']
         self.hitter_df = df[keep_cols + extra_cols].copy()
 
-        # Persist (even if empty)
         self._persist_hitter_df()
 
-        # Seasonal xBA fallback
-        row = self.bat_stats_2025[self.bat_stats_2025['Name'].str.contains(self.last_upper, case=False, na=False)]
-        self.xba = float(row.iloc[0]['xBA']) if not row.empty else 0.300
-
-    # ---------- assign cluster using hitter GMMs ----------
-    def _assign_row_cluster(self, row: pd.Series) -> str | float:
-        hand  = row.get('p_throws', None)
-        group = row.get('pitch_group', None)
-        if hand not in ['R', 'L'] or group not in ['4F', '2F', 'CF', 'S', 'C', 'CH']:
-            return np.nan
-        key = (hand, group)
-        if key not in self.gmm_models:
-            return np.nan
-        if pd.isna(row.get('release_speed')) or pd.isna(row.get('pfx_x')) or pd.isna(row.get('pfx_z')):
-            return np.nan
-        gmm, scaler, weights = self.gmm_models[key]
-        x_df = pd.DataFrame(
-            [[row['release_speed'], row['pfx_x'], row['pfx_z']]],
-            columns=['release_speed', 'pfx_x', 'pfx_z']
+        # ---- 12) Seasonal xBA (per AB) and per-PA hit probability ----
+        xba_ab, xpa = self.compute_seasonal_xpa(
+            self.bat_stats_2025,
+            player_id=self.player_id,
+            last_upper=self.last_upper,
+            first_upper=self.first_upper,
+            full_upper=self.full_upper,
+            team_name=self.team_name,
         )
-        xw = scaler.transform(x_df) * weights
-        comp = int(gmm.predict(xw)[0])
-        return f"{hand}{group}{comp+1}"
+        # Keep both for transparency; use xpa in the sim to avoid inflation
+        self.xba_ab = float(xba_ab)   # expected BA per AB (Statcast xBA)
+        self.xpa    = float(xpa)      # expected hit probability per PA (use this in MC)
+        # Backward-compat if other code references self.xba:
+        self.xba = self.xpa
+
 
     # ---------- build per-hitter xBA lookup (robust) ----------
     def _build_xba_lookup(self):
+        """
+        Build hierarchical xBA lookup from hitter_df.
+        Requirements:
+          - self.hitter_df exists, non-empty
+          - required columns present
+          - at least one BIP row with valid xBA
+        No seasonal or constant fallbacks. Fail fast on violations.
+        """
         os.makedirs("models", exist_ok=True)
 
+        # 0) Preflight: hitter_df must exist and have rows
         if not hasattr(self, "hitter_df") or self.hitter_df is None or self.hitter_df.empty:
-            self.global_bip_xba = float(getattr(self, "xba", 0.300) or 0.300)
-            self.xba_lookup_table = {
-                "L3": {}, "L2": {}, "L1": {},
-                "G": {('__GLOBAL__',): {"sum": self.global_bip_xba, "n": 1}},
-                "min_support": (20, 30, 40),
-                "prior_equiv": (20, 40, 80),
-                "mode": "mean",
-                "schema": "hierarchical_sum_n_v1"
-            }
-            joblib.dump(self.xba_lookup_table, "models/XBA_Lookup_Hierarchical.joblib")
-            return
+            raise ValueError(
+                f"hitter_df is missing/empty for {self.full_upper}; cannot build xBA lookup."
+            )
 
-        needed = ['estimated_ba_using_speedangle', 'pitch_cluster_enc', 'zone_enc', 'count_enc', 'description']
-        for c in needed:
-            if c not in self.hitter_df.columns:
-                self.hitter_df[c] = np.nan
+        # 1) Required columns must exist (no silent creation)
+        required_cols = ['pitch_cluster_enc', 'zone_enc', 'count_enc', 'description']
+        missing = [c for c in required_cols if c not in self.hitter_df.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required columns in hitter_df for {self.full_upper}: {missing}"
+            )
 
-        df = self.hitter_df.dropna(subset=['pitch_cluster_enc', 'zone_enc', 'count_enc']).copy()
+        # 2) Filter to rows that have all required encodings present
+        df = self.hitter_df.copy()
+        # Strict: do not fabricate values; all must be present
+        bad_mask = df[required_cols].isna().any(axis=1)
+        if bad_mask.any():
+            bad_n = int(bad_mask.sum())
+            total = len(df)
+            raise ValueError(
+                f"{bad_n}/{total} rows have NA in required fields for {self.full_upper}. "
+                f"First few bad indices: {df.index[bad_mask][:5].tolist()}"
+            )
+
+        # 3) Restrict to BIP rows with valid xBA
         bip = df[(df['description'] == 'bip') & df['estimated_ba_using_speedangle'].notna()].copy()
-
         if bip.empty:
-            self.global_bip_xba = float(getattr(self, "xba", 0.300) or 0.300)
-            self.xba_lookup_table = {
-                "L3": {}, "L2": {}, "L1": {},
-                "G": {('__GLOBAL__',): {"sum": self.global_bip_xba, "n": 1}},
-                "min_support": (20, 30, 40),
-                "prior_equiv": (20, 40, 80),
-                "mode": "mean",
-                "schema": "hierarchical_sum_n_v1"
-            }
-            joblib.dump(self.xba_lookup_table, "models/XBA_Lookup_Hierarchical.joblib")
-            return
+            raise ValueError("No BIP rows to build xBA lookup; cannot proceed.")
 
+        # 4) Global BIP xBA (for diagnostics only)
         self.global_bip_xba = float(
             bip['estimated_ba_using_speedangle'].astype(float).clip(0.0, 1.0).mean()
         )
 
+        # 5) Build hierarchical sum/n tables
         L3, L2, L1 = {}, {}, {}
-        G  = {('__GLOBAL__',): {"sum": 0.0, "n": 0}}
+        G = {('__GLOBAL__',): {"sum": 0.0, "n": 0}}
 
         def _add(tbl, key, x):
             if key not in tbl:
                 tbl[key] = {"sum": float(x), "n": 1}
             else:
                 tbl[key]["sum"] += float(x)
-                tbl[key]["n"]   += 1
+                tbl[key]["n"] += 1
 
         for row in bip.itertuples(index=False):
             p = int(getattr(row, 'pitch_cluster_enc'))
@@ -497,50 +742,85 @@ class Hitter:
             "mode": "mean",
             "schema": "hierarchical_sum_n_v1"
         }
+
         joblib.dump(self.xba_lookup_table, "models/XBA_Lookup_Hierarchical.joblib")
 
     # ---------- build per-hitter outcome hybrid (lookup + NB) ----------
     def _train_outcome_model(self, min_lookup_count: int = 5):
+        """
+        Train the hybrid outcome model (lookup + CategoricalNB) with no fallbacks.
+        Requirements:
+          - self.hitter_df exists and is non-empty
+          - required columns present
+          - no NA in required columns
+          - at least 1 row after filtering
+          - at least 2 distinct outcome classes to fit NB
+        Raises on any violation. Persists trained artifacts only on success.
+        """
         os.makedirs("models", exist_ok=True)
 
+        # 0) Preflight: hitter_df must exist and have rows
+        if not hasattr(self, "hitter_df") or self.hitter_df is None or self.hitter_df.empty:
+            raise ValueError(
+                f"hitter_df is missing/empty for {self.full_upper}; cannot train outcome model."
+            )
+
+        # 1) Required columns present?
         required = ['pitch_cluster_enc', 'zone_enc', 'count_enc', 'outcome_enc']
-        if not hasattr(self, 'hitter_df') or any(c not in self.hitter_df.columns for c in required):
-            self.outcome_lookup_table = defaultdict(Counter)
-            nb = CategoricalNB()
-            X_dummy = np.array([[0, 0, 0], [0, 0, 0]])
-            y_dummy = np.array([0, 1])
-            nb.fit(X_dummy, y_dummy)
-            self.nb_outcome_model = nb
-            self.outcome_class_labels = nb.classes_
-            joblib.dump(self.nb_outcome_model,     "models/hybrid_outcome_nb_model.joblib")
-            joblib.dump(self.outcome_lookup_table, "models/hybrid_outcome_lookup_table.joblib")
-            joblib.dump(self.outcome_class_labels, "models/hybrid_outcome_class_labels.joblib")
-            return
+        missing = [c for c in required if c not in self.hitter_df.columns]
+        if missing:
+            raise ValueError(
+                f"Missing required columns for outcome model ({self.full_upper}): {missing}"
+            )
 
-        df = self.hitter_df.dropna(subset=required).copy()
+        # 2) Strict NA policy (we already enforced earlier; double-check here)
+        df = self.hitter_df.copy()
+        bad_mask = df[required].isna().any(axis=1)
+        if bad_mask.any():
+            bad_n = int(bad_mask.sum())
+            total = len(df)
+            raise ValueError(
+                f"{bad_n}/{total} rows have NA in required outcome fields for {self.full_upper}. "
+                f"First few bad indices: {df.index[bad_mask][:5].tolist()}"
+            )
 
-        if df.empty:
-            self.outcome_lookup_table = defaultdict(Counter)
-            nb = CategoricalNB()
-            X_dummy = np.array([[0, 0, 0], [0, 0, 0]])
-            y_dummy = np.array([0, 1])
-            nb.fit(X_dummy, y_dummy)
-            self.nb_outcome_model = nb
-            self.outcome_class_labels = nb.classes_
-        else:
-            X = df[['pitch_cluster_enc', 'zone_enc', 'count_enc']].astype(int).values
-            y = df['outcome_enc'].astype(int).values
+        # 3) Filtered set must not be empty
+        if len(df) == 0:
+            raise ValueError(
+                f"Insufficient data to train outcome model for {self.full_upper} (empty after filtering)."
+            )
 
-            lookup_table = defaultdict(Counter)
-            for feats, target in zip(X, y):
-                lookup_table[tuple(feats)][int(target)] += 1
+        # 4) Prepare X, y; require ≥2 classes in y for NB to be meaningful
+        X = df[['pitch_cluster_enc', 'zone_enc', 'count_enc']].astype(int).values
+        y = df['outcome_enc'].astype(int).values
+        unique_y = np.unique(y)
+        if unique_y.size < 2:
+            raise ValueError(
+                f"Insufficient class variety to train outcome model for {self.full_upper}: "
+                f"found {unique_y.size} class(es) in 'outcome_enc'."
+            )
 
-            nb_model = CategoricalNB()
-            nb_model.fit(X, y)
+        # 5) Build lookup table (counts only; thresholds applied downstream at inference)
+        lookup_table = defaultdict(Counter)
+        for feats, target in zip(X, y):
+            lookup_table[tuple(feats)][int(target)] += 1
 
-            self.outcome_lookup_table = lookup_table
-            self.nb_outcome_model = nb_model
-            self.outcome_class_labels = nb_model.classes_
+        # Optional: sanity check for extremely sparse table (informative, not a fallback)
+        total_keys = len(lookup_table)
+        if total_keys == 0:
+            raise ValueError(
+                f"No keys populated in outcome lookup table for {self.full_upper}; cannot train."
+            )
+
+        # 6) Fit NB (categorical)
+        nb_model = CategoricalNB()
+        nb_model.fit(X, y)
+        class_labels = nb_model.classes_
+
+        # 7) Persist artifacts
+        self.outcome_lookup_table = lookup_table
+        self.nb_outcome_model = nb_model
+        self.outcome_class_labels = class_labels
 
         joblib.dump(self.nb_outcome_model,     "models/hybrid_outcome_nb_model.joblib")
         joblib.dump(self.outcome_lookup_table, "models/hybrid_outcome_lookup_table.joblib")
